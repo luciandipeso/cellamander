@@ -4,13 +4,10 @@ from cellpose import models, dynamics, plot
 from tifffile import tifffile
 import json
 from copy import deepcopy
+from roifile import ImagejRoi
+import cv2
+from tqdm import tqdm, trange
 
-# images = [ [[]] ] # n x r x c x channels
-# cs = Cellamander()
-# cs.mander(images, { {}, {} })
-# cs.mander(images, [ 'CD4.json', 'CD11c.json' ])
-# recipe = cs.find_recipe(images, 'path/to/rois')
-# cs.save_recipe(recipe, 'path/to/recipe')
 class CellamanderRecipe:
 
     def __init__(self, json):
@@ -261,6 +258,180 @@ class Cellamander:
             all_flows[recipe.name] = [ plot.dx_to_circ(dP), dP, cellprob, np.squeeze(p) ]
 
         return all_masks, all_flows
+
+    def find_recipes(self, images, roi_files, required_channels=[], absent_channels=[], ignore_dP_channels=[], ignore_cellprob_channels=[], **kwargs):
+        """
+        Determine performance of different recipes
+
+        Searches a range of different weight combinations, using ground
+        truth ROIs to determine performance.
+
+        Parameters
+        --------
+        images np.array Images that have ground truth masks
+        roi_files list|np.array Paths to ImageJ ROIs, a list of ROI paths for each image in images
+        required_channels list List of any channels that must be present for this phenotype
+        absent_channels list List of any channels that must be absent for this phenotype
+        ignore_dP_channels list List of any channels whose dP matrices should not be evaluated
+        ignore_cellprob_channels list List of any channels whose cellprob matrices should not be evaluated
+
+        All other parameters passed to Cellamander.mander()
+
+        Returns
+        --------
+        pd.DataFrame Dataframe containing performance metrics for each ROI
+        pd.DataFrame Dataframe containing performance metrics for each predicted mask
+        pd.DataFrame The recipe IDs and weights
+        """
+
+        # To save search time, we'll only take non-negative weights for the
+        # target channel
+        num_channels = images.shape[-1]
+
+        weights = []
+        for c in range(num_channels):            
+            if c in ignore_dP_channels:
+                dP_r = np.array([0])
+            elif c in required_channels:
+                dP_r = np.arange(0.25, 1.25, 0.25)
+            elif c in absent_channels:
+                dP_r = np.arange(-1, 0.25, 0.25)
+            else:
+                dP_r = np.arange(-1, 1.25, 0.25)
+
+            if c in ignore_cellprob_channels:
+                cellprob_r = np.array([0])
+            elif c in required_channels:
+                cellprob_r = np.arange(0.25, 1.25, 0.25)
+            elif c in absent_channels:
+                cellprob_r = np.arange(-1, 0.25, 0.25)
+            else:
+                cellprob_r = np.arange(-1, 1.25, 0.25)
+
+            weights.append(np.concatenate([ dP_r, cellprob_r ]))
+
+        weights = np.transpose(np.array(np.meshgrid(*(weights)))).reshape(-1, num_channels*2)
+        
+        gt_dfs, pred_dfs = [], []
+
+        for weights_idx in trange(weights.shape):
+            recipe_json = {
+                'meta': { 'name': weights_idx },
+                'data': []
+            }
+            for c in range(num_channels):
+                recipe_json['data'].append({
+                    'dP': weights[weights_idx, c],
+                    'cellprob': weights[weights_idx, c+num_channels]
+                })
+            recipe = CellamanderRecipe(recipe_json)
+
+            gt_df, pred_df = self._test_recipe(images, recipe, roi_files, **kwargs)
+            gt_dfs.append(gt_df)
+            pred_dfs.append(pred_df)
+
+        gt_dfs = pd.concat(gt_dfs)
+        pred_dfs = pd.concat(pred_dfs)
+
+        columns = {}
+        for c in range(num_channels):
+            columns[c] = 'dP_{}'.format(c)
+            columns[c+num_channels] = 'cellprob_{}'.format(c)
+        weights = pd.DataFrame(weights).rename(columns=columns)
+
+        return pred_dfs, gt_dfs, weights
+
+    def _test_recipe(self, images, recipe, roi_files, **kwargs):
+        gt_df = {
+            'image_id': [],
+            'roi': [],
+            'recipe_id': [],
+            'labels': [],
+            'ious': [],
+            'best_label': [],
+            'best_iou': []
+        }
+        pred_df = {
+            'image_id': [],
+            'recipe_id': [],
+            'iou': [],
+            'miou': [],
+            'miou_tp_50': [],
+            'tp_50': [],
+            'fp_50': [],
+            'fn_50': [],
+            'ap_50': []   
+        }
+
+        masks, flows = self.mander(images, [ recipe ], **kwargs)
+
+        gt_mask = np.zeros_like(masks[0])
+
+        for n in range(images.shape[0]):
+            my_rois = roi_files[n]
+            my_masks = masks[n]
+            for roi_file in my_rois:
+                roi = ImagejRoi.fromfile(roi_file)
+                vertices = np.expand_dims(roi.corrdinates(), axis=1).astype(np.uint32)
+                roi_poly = cv2.fillPoly(np.zeros_like(images[n][...,0]), [vertices], 1)
+                gt_mask += roi_poly
+
+                gt_df['image_id'].append(n)
+                gt_df['roi'].append(roi.name)
+                gt_df['recipe_id'].append(recipe.name)
+
+                labels = np.unique(my_masks[(roi_poly > 0) & (my_masks > 0)])
+                ious = []
+                for label in labels:
+                    intersection = np.sum( ((my_masks == label) & (roi_poly > 0)) )
+                    union = np.sum( ((my_masks == label) | (roi_poly > 0)) )
+                    ious.append(intersection/union)
+
+                gt_df['labels'].append(labels)
+                gt_df['ious'].append(ious)
+
+                if len(labels) > 0:
+                    gt_df['best_iou'].append(np.max(ious))
+                    gt_df['best_label'].append(labels[ious.index(np.max(ious))])
+                else:
+                    gt_df['best_iou'].append(0.0)
+                    gt_df['best_label'].append(0)
+
+            gt_df = pd.DataFrame(gt_df)
+            all_labels = gt_df['best_label'].unique()
+
+            num_fn = gt_df.loc[(gt_df['best_iou'] < 0.5)].shape[0]
+            num_tp = gt_df.loc[(gt_df['best_iou'] >= 0.5)].shape[0]
+            num_fp = np.unique(my_masks[(my_masks != 0) & ~np.isin(my_masks, all_labels)]).shape[0]
+            
+            ap = num_tp / (num_tp+num_fp+num_fn)
+
+            if ap > 0:
+                intersection = np.sum((my_masks > 0) & (gt_mask > 0))
+                union = np.sum((my_masks > 0) | (gt_mask > 0))
+                if intersection == 0 or union == 0:
+                    iou = 0
+                else:
+                    iou = intersection / union
+
+                pred_df['image_id'].append(n)
+                pred_df['recipe_id'].append(recipe.name)
+                pred_df['iou'].append(iou)
+                pred_df['miou'].append(np.mean(gt_df['best_iou']))
+                pred_df['miou_tp_50'].append(np.mean(gt_df.loc[(gt_df['best_iou'] >= 0.5), 'best_iou']))
+                pred_df['tp_50'].append(num_tp)
+                pred_df['fp_50'].append(num_fp)
+                pred_df['fn_50'].append(num_fn)
+                pred_df['ap_50'].append(ap)
+
+            pred_df = pd.DataFrame(pred_df)
+            return gt_df, pred_df
+
+
+
+
+
+
 
 
 
