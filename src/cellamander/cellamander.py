@@ -7,6 +7,7 @@ from copy import deepcopy
 from roifile import ImagejRoi
 import cv2
 from tqdm import tqdm, trange
+import pandas as pd
 
 class CellamanderRecipe:
 
@@ -15,8 +16,12 @@ class CellamanderRecipe:
         self.instructions = json['data']
         self._raw_json = deepcopy(json)
 
-    def save(self):
-        pass
+    # TODO: 
+    def save(self, path):
+        raise NotImplementedError
+
+class InvalidRecipe(Exception):
+    pass
 
 
 class Cellamander:
@@ -52,7 +57,8 @@ class Cellamander:
                 recipe = CellamanderRecipe(json.load(f))
 
         if not isinstance(recipe, CellamanderRecipe):
-            raise InvalidRecipe()
+            pass
+            # raise InvalidRecipe()
 
         return recipe
 
@@ -117,7 +123,7 @@ class Cellamander:
         for recipe in recipes:
             loaded_recipes.append(self._load_recipe(recipe))
 
-        for n in images.shape[0]:
+        for n in range(images.shape[0]):
             masks, flows = self._mander_image(
                 images[n], 
                 loaded_recipes, 
@@ -161,7 +167,7 @@ class Cellamander:
         tile=True,
         tile_overlap=0.1,
         bsize=224,
-        interp=interp,
+        interp=True,
         progress=None
     ):
         """
@@ -169,7 +175,7 @@ class Cellamander:
 
         Parameters
         --------
-        images np.array An image of the format row x col x channels
+        image np.array An image of the format row x col x channels
         recipes list A list of CellamanderRecipe instances
         
         The remainder parameters are passed to cellpose. 
@@ -180,7 +186,7 @@ class Cellamander:
                     Keys are recipe names
         """
         flows = {}
-        for c in range(images.shape[-1]):
+        for c in range(image.shape[-1]):
             _, tmp, _ = self._model.eval(
                 image[...,c],
                 batch_size=batch_size,
@@ -232,7 +238,7 @@ class Cellamander:
             for c,value in enumerate(recipe.instructions):
                 dP += value['dP']*flows[c]['dP']
                 cellprob += value['cellprob']*flows[c]['cellprob']
-                if norm_to is None and value['dP'] > 0 and value['cellprob'] > 0:
+                if norm_to is None and value['cellprob'] > 0:
                     norm_to = c
 
             dP = Cellamander._normalize_matrix(dP, flows[norm_to]['dP'])
@@ -259,7 +265,7 @@ class Cellamander:
 
         return all_masks, all_flows
 
-    def find_recipes(self, images, roi_files, required_channels=[], absent_channels=[], ignore_dP_channels=[], ignore_cellprob_channels=[], **kwargs):
+    def find_recipes(self, images, roi_files, required_channels=[], absent_channels=[], ignore_dP_channels=[], ignore_cellprob_channels=[], step_size=0.25, fix_dPs=[], fix_cellprobs=[], **kwargs):
         """
         Determine performance of different recipes
 
@@ -274,6 +280,9 @@ class Cellamander:
         absent_channels list List of any channels that must be absent for this phenotype
         ignore_dP_channels list List of any channels whose dP matrices should not be evaluated
         ignore_cellprob_channels list List of any channels whose cellprob matrices should not be evaluated
+        step_size float
+        fix_dPs list List of floats or None. Channel i dP will be fixed to the value at index i
+        fix_cellprobs list List of floats or None. Channel i dP will be fixed to the value at index i
 
         All other parameters passed to Cellamander.mander()
 
@@ -289,32 +298,41 @@ class Cellamander:
         num_channels = images.shape[-1]
 
         weights = []
-        for c in range(num_channels):            
+        for c in range(num_channels):
             if c in ignore_dP_channels:
                 dP_r = np.array([0])
             elif c in required_channels:
-                dP_r = np.arange(0.25, 1.25, 0.25)
+                dP_r = np.arange(step_size, 1+step_size, step_size)
             elif c in absent_channels:
-                dP_r = np.arange(-1, 0.25, 0.25)
+                dP_r = np.arange(-1, step_size, step_size)
             else:
-                dP_r = np.arange(-1, 1.25, 0.25)
+                dP_r = np.arange(-1, 1+step_size, step_size)
+            weights.append(dP_r)
 
+        for c in range(num_channels):
             if c in ignore_cellprob_channels:
                 cellprob_r = np.array([0])
             elif c in required_channels:
-                cellprob_r = np.arange(0.25, 1.25, 0.25)
+                cellprob_r = np.arange(step_size, 1+step_size, step_size)
             elif c in absent_channels:
-                cellprob_r = np.arange(-1, 0.25, 0.25)
+                cellprob_r = np.arange(-1, step_size, step_size)
             else:
-                cellprob_r = np.arange(-1, 1.25, 0.25)
-
-            weights.append(np.concatenate([ dP_r, cellprob_r ]))
+                cellprob_r = np.arange(-1, 1+step_size, step_size)
+            weights.append(cellprob_r)
 
         weights = np.transpose(np.array(np.meshgrid(*(weights)))).reshape(-1, num_channels*2)
+
+        for c,fixed_dP in enumerate(fix_dPs):
+            if fixed_dP is not None:
+                weights = weights[weights[...,c] == fixed_dP]
+
+        for c,fixed_cellprob in enumerate(fix_cellprobs):
+            if fixed_cellprob is not None:
+                weights = weights[weights[...,c+num_channels] == fixed_cellprob]
         
         gt_dfs, pred_dfs = [], []
 
-        for weights_idx in trange(weights.shape):
+        for weights_idx in trange(weights.shape[0]):
             recipe_json = {
                 'meta': { 'name': weights_idx },
                 'data': []
@@ -342,7 +360,7 @@ class Cellamander:
         return pred_dfs, gt_dfs, weights
 
     def _test_recipe(self, images, recipe, roi_files, **kwargs):
-        gt_df = {
+        gt_df_template = {
             'image_id': [],
             'roi': [],
             'recipe_id': [],
@@ -364,21 +382,22 @@ class Cellamander:
         }
 
         masks, flows = self.mander(images, [ recipe ], **kwargs)
-
-        gt_mask = np.zeros_like(masks[0])
+        gt_mask = np.zeros_like(masks[0][recipe.name], dtype=np.int32)
+        gt_df = []
 
         for n in range(images.shape[0]):
+            tmp = deepcopy(gt_df_template)
             my_rois = roi_files[n]
-            my_masks = masks[n]
+            my_masks = masks[n][recipe.name]
             for roi_file in my_rois:
                 roi = ImagejRoi.fromfile(roi_file)
-                vertices = np.expand_dims(roi.corrdinates(), axis=1).astype(np.uint32)
+                vertices = np.expand_dims(roi.coordinates(), axis=1).astype(np.int32)
                 roi_poly = cv2.fillPoly(np.zeros_like(images[n][...,0]), [vertices], 1)
                 gt_mask += roi_poly
 
-                gt_df['image_id'].append(n)
-                gt_df['roi'].append(roi.name)
-                gt_df['recipe_id'].append(recipe.name)
+                tmp['image_id'].append(n)
+                tmp['roi'].append(roi.name)
+                tmp['recipe_id'].append(recipe.name)
 
                 labels = np.unique(my_masks[(roi_poly > 0) & (my_masks > 0)])
                 ious = []
@@ -387,21 +406,21 @@ class Cellamander:
                     union = np.sum( ((my_masks == label) | (roi_poly > 0)) )
                     ious.append(intersection/union)
 
-                gt_df['labels'].append(labels)
-                gt_df['ious'].append(ious)
+                tmp['labels'].append(labels)
+                tmp['ious'].append(ious)
 
                 if len(labels) > 0:
-                    gt_df['best_iou'].append(np.max(ious))
-                    gt_df['best_label'].append(labels[ious.index(np.max(ious))])
+                    tmp['best_iou'].append(np.max(ious))
+                    tmp['best_label'].append(labels[ious.index(np.max(ious))])
                 else:
-                    gt_df['best_iou'].append(0.0)
-                    gt_df['best_label'].append(0)
+                    tmp['best_iou'].append(0.0)
+                    tmp['best_label'].append(0)
 
-            gt_df = pd.DataFrame(gt_df)
-            all_labels = gt_df['best_label'].unique()
+            tmp = pd.DataFrame(tmp)
+            all_labels = tmp['best_label'].unique()
 
-            num_fn = gt_df.loc[(gt_df['best_iou'] < 0.5)].shape[0]
-            num_tp = gt_df.loc[(gt_df['best_iou'] >= 0.5)].shape[0]
+            num_fn = tmp.loc[(tmp['best_iou'] < 0.5)].shape[0]
+            num_tp = tmp.loc[(tmp['best_iou'] >= 0.5)].shape[0]
             num_fp = np.unique(my_masks[(my_masks != 0) & ~np.isin(my_masks, all_labels)]).shape[0]
             
             ap = num_tp / (num_tp+num_fp+num_fn)
@@ -417,15 +436,17 @@ class Cellamander:
                 pred_df['image_id'].append(n)
                 pred_df['recipe_id'].append(recipe.name)
                 pred_df['iou'].append(iou)
-                pred_df['miou'].append(np.mean(gt_df['best_iou']))
-                pred_df['miou_tp_50'].append(np.mean(gt_df.loc[(gt_df['best_iou'] >= 0.5), 'best_iou']))
+                pred_df['miou'].append(np.mean(tmp['best_iou']))
+                pred_df['miou_tp_50'].append(np.mean(tmp.loc[(tmp['best_iou'] >= 0.5), 'best_iou']))
                 pred_df['tp_50'].append(num_tp)
                 pred_df['fp_50'].append(num_fp)
                 pred_df['fn_50'].append(num_fn)
                 pred_df['ap_50'].append(ap)
+            gt_df.append(tmp)
 
-            pred_df = pd.DataFrame(pred_df)
-            return gt_df, pred_df
+        gt_df = pd.concat(gt_df)
+        pred_df = pd.DataFrame(pred_df)
+        return gt_df, pred_df
 
 
 
