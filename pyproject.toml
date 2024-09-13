@@ -1,0 +1,36 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "Cellamander"
+version = "0.0.1"
+authors = [{ name = "Lucian DiPeso", email="ldipeso@gmail.com" }]
+description = "A package for combining Cellpose gradients for cell phenotyping"
+readme = "README.md"
+requires-python = ">=3.12"
+classifiers = [
+  "Programming Language :: Python :: 3",
+  "License :: OSI Approved :: BSD License",
+  "Operating System :: OS Independent",
+]
+dependencies = [
+  "opencv-contrib-python",
+  "cellpose",
+  "numpy",
+  "pandas",
+  "tifffile",
+  "jupyter",
+  "scikit-image",
+  "roifile",
+  "tqdm"
+]
+keywords = [
+  "cellpose",
+  "U-Net",
+  "segmentation",
+  "phenotyping"
+]
+
+[project.urls]
+"Homepage" = "https://github.com/luciandipeso/cellamander"
